@@ -21,17 +21,10 @@
 </head>
 
 <body class="ms-font-m ms-welcome ms-Fabric">
-    <header class="ms-welcome__header ms-bgColor-neutralLighter">
-        <img width="90" height="90" src="../../assets/logo-filled.png" alt="Contoso" title="Contoso" />
-        <h1 class="ms-font-su">Welcome</h1>
-    </header>
-    <section id="sideload-msg" class="ms-welcome__main">
-        <h2 class="ms-font-xl">Please <a target="_blank" href="https://learn.microsoft.com/office/dev/add-ins/testing/test-debug-office-add-ins#sideload-an-office-add-in-for-testing">sideload</a> your add-in to see app body.</h2>
-    </section>
     <main id="app-body" class="ms-welcome__main" style="display: none;">
-        <textarea id="agent-input" placeholder="Ask the agent..." style="width:100%;height:120px;"></textarea>
-        <br/><br/>
-        <button class="ms-Button" id="run-agent">Run Agent</button>
+        <div id="chat-window" style="height:300px; overflow-y:auto; border:1px solid #ccc; padding:10px;"></div>
+        <textarea id="agent-input" placeholder="Type your message..." style="width:100%; height:80px;"></textarea> 
+        <button id="run-agent">Send</button>
     </main>
 
 </body>

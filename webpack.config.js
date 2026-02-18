@@ -6,6 +6,8 @@ const HtmlWebpackPlugin = require("html-webpack-plugin");
 
 const urlDev = "https://localhost:3000/";
 const urlProd = "https://www.contoso.com/"; // CHANGE THIS TO YOUR PRODUCTION DEPLOYMENT LOCATION
+const webpack = require("webpack"); 
+require("dotenv").config();
 
 async function getHttpsOptions() {
   const httpsOptions = await devCerts.getHttpsServerOptions();
@@ -80,6 +82,9 @@ module.exports = async (env, options) => {
         template: "./src/commands/commands.html",
         chunks: ["polyfill", "commands"],
       }),
+      new webpack.DefinePlugin({ 
+        "process.env.FOUNDRY_API_KEY": JSON.stringify(process.env.FOUNDRY_API_KEY) 
+      })
     ],
     devServer: {
       headers: {

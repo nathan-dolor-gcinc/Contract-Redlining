@@ -23,7 +23,7 @@
     display: -webkit-flex;
     display: flex;
     -webkit-flex-direction: column;
-    flex-direction: column;
+    -ms-flex-direction: column;
     align-items: center;
  }
 
@@ -31,13 +31,13 @@
     display: -webkit-flex;
     display: flex;
     -webkit-flex-direction: column;
-    flex-direction: column;
+    -ms-flex-direction: column;
     -webkit-flex-wrap: nowrap;
     flex-wrap: nowrap;
     -webkit-align-items: center;
     align-items: center;
     -webkit-flex: 1 0 0;
-    flex: 1 0 0;
+    -ms-flex: 1 0 0;
     padding: 10px 20px;
  }
  
