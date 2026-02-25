@@ -1,0 +1,92 @@
+<!-- Copyright (c) Microsoft Corporation. All rights reserved. Licensed under the MIT License. -->
+<!-- This file shows how to design a first-run page that provides a welcome screen to the user about the features of the add-in. -->
+ 
+<!DOCTYPE html>
+<html>
+ 
+<head>
+    <meta http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self' https://appsforoffice.microsoft.com;
+        script-src  'self' 'unsafe-inline' https://appsforoffice.microsoft.com;
+        style-src   'self' 'unsafe-inline' https://fonts.googleapis.com;
+        connect-src 'self' https://localhost:3001 https://appsforoffice.microsoft.com;
+      ">
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Contract Redlining</title>
+ 
+    <!-- Office JavaScript API -->
+    <script type="text/javascript" src="https://appsforoffice.microsoft.com/lib/1.1/hosted/office.js"></script>
+ 
+    <!-- For more information on Fluent UI, visit https://developer.microsoft.com/fluentui#/. -->
+    <link rel="stylesheet" href="https://static2.sharepointonline.com/files/fabric/office-ui-fabric-core/11.0.0/css/fabric.min.css"/>
+ 
+    <!-- Template styles -->
+    <link href="taskpane.css" rel="stylesheet" type="text/css" />
+</head>
+ 
+<body>
+<!-- Header (visible) -->
+ <header class="header">
+    <div class="header-title">Contract Redlining</div>
+    <div class="header-subtitle">Redline your contract with AI</div>
+</header>
+
+<!--
+    Doc Status Bar
+    Stats of redlined sections & reviewed sections
+-->
+<div class="doc-status" id="doc-status-bar" style="display:none">
+    <div class="doc-name" id="doc-name-text"> Loading...</div>
+    <div class="doc-stats">
+        <span><strong id="stat-total">--</strong> redlines</span>
+        <span><strong id="stat-reviewed">--</strong> reviewed</span>
+    </div>
+</div>
+
+<!--
+    Progress Checker
+    Shows progress bar of how many sections need to be redlined and how many have been redlined
+-->
+<div class="progress-checker" id="doc-status-bar" style="display:none;">
+    <div class="progress-header">
+        <span>Section Progress</span>
+        <span id="progress-label">--</span>
+    </div>
+    <div class="progress-check" id="progressCheck"></div>
+</div>
+<!--
+    Main App Body
+-->
+    <main id="app-body" style="display:none;">
+ 
+        <!-- Chat Window -->
+        <div id="chat-window">
+            <div class="loading" id="initial-loading">
+                <div class="spinner"></div>
+                <p>Loading Contract Redlining...</p>
+            </div>
+        </div>
+ 
+        <!-- Input Row-->
+        <div class="input-row">
+            <div class="input-wrap">
+                <textarea id="agent-input" placeholder="Ask about this contract… (Enter to send)" rows="1"
+                ></textarea>
+            </div>
+            <button id="run-agent" class="send-btn" title="Send (Enter)">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" stroke-width="2.5"
+                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <line x1="22" y1="2" x2="11" y2="13"/>
+                    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                </svg>
+            </button>
+        </div>
+ 
+    </main>
+ 
+</body>
+</html>
