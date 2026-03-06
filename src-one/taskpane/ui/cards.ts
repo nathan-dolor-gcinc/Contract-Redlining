@@ -1,8 +1,8 @@
 // src-one/taskpane/ui/cards.ts
 
 import { esc, scrollChat } from "./dom";
-import { buildInlineDiff } from "../tools/wordTools";
-import type { RedlinedSection, RedlineCluster } from "../tools/wordTools";
+import { buildInlineDiff, extractSnippetClientSide, extractCenteredWindow } from "../tools/wordTools";
+import type { RedlinedSection, RedlineCluster, TrackedChangeInfo } from "../tools/wordTools";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -232,32 +232,92 @@ export function appendAnalysisCard(
 
 // ─── Inline diff helpers ──────────────────────────────────────────────────────
 
-// Renders the diff for a cluster using cluster.paragraphText (the AI-chosen
-// snippet) as the display text. buildInlineDiff searches the snippet for each
-// change's text and marks insertions with <ins> and deletions with <del> inline.
+// Renders a single unified inline diff for all changes in a cluster.
 //
-// Because paragraphText is a verbatim substring of paragraphContext (which is
-// captured before changes are accepted), both inserted and deleted text are
-// present in it and can be found by substring search.
+// Changes are grouped by their underlying paragraph (using rawParagraphText
+// so deletions — whose text is absent from paragraph.text — are still
+// correctly co-located with insertions from the same sentence).
+//
+// For each paragraph group:
+//   1. A union window is derived that covers every change's text, giving
+//      buildInlineDiff a single string where ALL marks can be found.
+//   2. buildInlineDiff is called ONCE with ALL changes for that paragraph,
+//      producing one continuous block with interleaved <del>/<ins> marks.
+//
+// This replaces the old per-change grouping that produced a separate block
+// for every individual change — which was confusing for users.
 function buildClusterDiffHtml(cluster: RedlineCluster): string {
-  // Group changes by paragraphContext key so multi-paragraph clusters render correctly.
-  const byParagraph = new Map<string, { snippet: string; changes: typeof cluster.changes }>();
+  // ── Group changes by their raw (unmodified) paragraph ────────────────────
+  // rawParagraphText is the full paragraph without deletion augmentation,
+  // so insertions and deletions from the same sentence share the same key.
+  const byParagraph = new Map<string, { rawPara: string; changes: typeof cluster.changes }>();
 
   for (const change of cluster.changes) {
-    const key = change.paragraphContext ?? "";
+    const key = change.rawParagraphText ?? change.paragraphContext ?? "";
     if (!byParagraph.has(key)) {
-      // Use cluster.paragraphText (the AI snippet) as the display text.
-      // This is a verbatim substring of paragraphContext so change text
-      // within this window will be found by buildInlineDiff.
-      byParagraph.set(key, { snippet: cluster.paragraphText, changes: [] });
+      byParagraph.set(key, { rawPara: key, changes: [] });
     }
     byParagraph.get(key)!.changes.push(change);
   }
 
   return Array.from(byParagraph.values()).map((block) => {
-    const authors = [...new Set(block.changes.map((c) => c.author).filter(Boolean))];
+    const { rawPara, changes } = block;
+
+    // ── Build a unified snippet covering ALL changes in this paragraph ──────
+    //
+    // For each change find its position in rawPara (insertions are present;
+    // deletions are not — we append them temporarily for position finding).
+    // Then take the union of all windows to get one continuous display region.
+    const paraWithDeletions = (() => {
+      let augmented = rawPara;
+      for (const c of changes) {
+        const isDel = (c.type ?? "").toLowerCase().includes("delet");
+        if (isDel && c.text.trim()) {
+          const norm = (s: string) => s.replace(/[‘’]/g, "'")
+            .replace(/[“”]/g, '"').replace(/[–—]/g, "-")
+            .replace(/ /g, " ").replace(/\s+/g, " ").toLowerCase().trim();
+          if (!norm(augmented).includes(norm(c.text.slice(0, 40)))) {
+            augmented = augmented + " " + c.text;
+          }
+        }
+      }
+      return augmented;
+    })();
+
+    // Expand individual windows and take their union
+    const windows = changes.map((c) => extractCenteredWindow(paraWithDeletions, c.text, 300));
+    const unifiedSnippet = (() => {
+      if (windows.length === 0) return paraWithDeletions.slice(0, 800);
+      // Find earliest start and latest end among all windows (by searching their
+      // text in the augmented paragraph, falling back to the longest window)
+      let earliest = paraWithDeletions.length;
+      let latest = 0;
+      for (const w of windows) {
+        if (!w) continue;
+        const pos = paraWithDeletions.indexOf(w.slice(0, 30));
+        if (pos !== -1) {
+          earliest = Math.min(earliest, pos);
+          latest   = Math.max(latest, pos + w.length);
+        }
+      }
+      if (earliest >= latest) {
+        // Fallback: just use the longest window
+        return windows.reduce((a, b) => (b.length > a.length ? b : a), "");
+      }
+      // Snap to sentence boundaries
+      const beforeCut = paraWithDeletions.lastIndexOf(". ", earliest);
+      const afterCut  = paraWithDeletions.indexOf(". ", latest);
+      const start = beforeCut !== -1 && beforeCut >= earliest - 200 ? beforeCut + 2 : earliest;
+      const end   = afterCut  !== -1 && afterCut  <= latest  + 200 ? afterCut  + 1 : latest;
+      return paraWithDeletions.slice(start, end).trim();
+    })();
+
+    const authors = [...new Set(changes.map((c) => c.author).filter(Boolean))];
     const authorLine = authors.length ? `by ${authors.join(", ")}` : "";
-    const diffHtml = buildInlineDiff(block.snippet, block.changes);
+
+    // Single buildInlineDiff call with ALL changes → one unified diff block
+    const diffHtml = buildInlineDiff(unifiedSnippet, changes);
+
     return `
 <div class="diff-paragraph">
   ${authorLine ? `<div class="diff-paragraph__meta">${esc(authorLine)}</div>` : ""}

@@ -11,6 +11,10 @@ export interface TrackedChangeInfo {
   sectionTitle: string;
   sectionNumber: string;
   paragraphContext: string;
+  /** Full unmodified paragraph (no deletion augmentation, no slice limit).
+   *  Used by buildClusterDiffHtml to group co-paragraph changes into one
+   *  unified inline diff instead of a separate block per change. */
+  rawParagraphText: string;
 }
 
 export interface RedlinedSection {
@@ -86,7 +90,29 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
     }
     console.groupEnd();
 
-    return changes.items.flatMap((c) => {
+    // ── Pass 1: attribute each change to a section using paragraph text ─────
+    //
+    // NOTE on deletions: Word's paragraph.text API omits tracked-deleted text
+    // (it returns the post-acceptance state). This means:
+    //   • findSectionByPosition / findSectionForText may FAIL for deletions
+    //     because the deleted text isn't in any paraTexts[i].
+    //   • Even when attribution succeeds, paragraphContext won't contain the
+    //     deleted text, so extractSnippetClientSide returns the full paragraph
+    //     and buildInlineDiff can't highlight the deletion.
+    //
+    // Pass 1 handles normal attribution. Pass 2 (below) handles the two
+    // failure modes specific to deletions.
+
+    type RawChangeEntry = {
+      c: Word.TrackedChange;
+      id: string;
+      date: string;
+      changeText: string;
+      section: { sectionNumber: string; sectionTitle: string; paragraphContext: string } | null;
+      isDeletion: boolean;
+    };
+
+    const rawEntries: RawChangeEntry[] = changes.items.map((c) => {
       const raw = c as unknown as Record<string, unknown>;
       const id = typeof raw["id"] === "string" ? raw["id"] : String(raw["id"] ?? "");
 
@@ -96,8 +122,9 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
         typeof rawDate === "string" ? rawDate : "";
 
       const changeText = c.text ?? "";
+      const isDeletion = String(c.type ?? "").toLowerCase().includes("delet");
 
-      console.group(`[attribution] "${changeText.slice(0, 60)}" (${c.type})`);
+      console.group(`[attribution pass-1] "${changeText.slice(0, 60)}" (${c.type})`);
 
       let section = findSectionByPosition(changeText, paraTexts, paraIndexToSection);
       if (!section) {
@@ -105,24 +132,131 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
         if (found?.sectionNumber) section = found;
       }
 
+      if (section) {
+        console.log(`  ✅ § ${section.sectionNumber} | context: "${section.paragraphContext?.slice(0, 80)}"`);
+      } else {
+        console.warn(isDeletion
+          ? "  ⚠ Not found in pass-1 (deletion text absent from paragraph.text) — will retry in pass-2"
+          : "  ⚠ Not found — will DROP");
+      }
+      console.groupEnd();
+
+      return { c, id, date, changeText, section, isDeletion };
+    });
+
+    // ── Pass 2: range-based fallback for deletions that weren't attributed ───
+    //
+    // For deletion changes where pass-1 failed (deleted text not in any
+    // paragraph.text), load the change's Range and use the surrounding
+    // paragraph's text — which IS in paragraph.text — to identify the section.
+
+    const unattributed = rawEntries.filter((e) => !e.section && e.isDeletion);
+
+    if (unattributed.length > 0) {
+      const rangeParaCollections: Array<{ entry: RawChangeEntry; paras: Word.ParagraphCollection }> = [];
+
+      for (const entry of unattributed) {
+        try {
+          const range = (entry.c as any).getRange() as Word.Range;
+          const paras = range.paragraphs;
+          paras.load("items/text");
+          rangeParaCollections.push({ entry, paras });
+        } catch {
+          // getRange() not available on this Word version — will stay unattributed
+        }
+      }
+
+      if (rangeParaCollections.length > 0) {
+        await context.sync();
+
+        for (const { entry, paras } of rangeParaCollections) {
+          console.group(`[attribution pass-2] "${entry.changeText.slice(0, 60)}"`);
+
+          for (const para of paras.items) {
+            const paraText = (para as any).text as string ?? "";
+            if (paraText.trim().length < 6) continue;
+
+            // Find this neighbouring paragraph in our index to get its section
+            const firstWords = paraText.trim().split(/\s+/).slice(0, 6).join(" ").toLowerCase();
+            for (let i = 0; i < paraTexts.length; i++) {
+              if (paraTexts[i].toLowerCase().includes(firstWords)) {
+                const sec = paraIndexToSection[i];
+                if (sec?.sectionNumber) {
+                  entry.section = {
+                    sectionNumber: sec.sectionNumber,
+                    sectionTitle: sec.sectionTitle,
+                    // full paragraph — caller will extract a centered window
+                    paragraphContext: paraTexts[i],
+                  };
+                  console.log(`  ✅ § ${sec.sectionNumber} via range neighbour`);
+                  break;
+                }
+              }
+            }
+            if (entry.section) break;
+          }
+
+          if (!entry.section) console.warn("  ⚠ DROPPING — range fallback also failed");
+          console.groupEnd();
+        }
+      }
+    }
+
+    // ── Finalise: extract per-change centered paragraphContext ───────────────
+    //
+    // Each change gets its OWN context window centered on its change text.
+    // This fixes two issues that the old slice(0,2000) approach caused:
+    //
+    //   1. All changes in the same paragraph shared the same leading-edge
+    //      context — changes deep in a long paragraph (e.g. "ten percent (10%)"
+    //      or the "Notwithstanding" clause in §6 PAYMENT) were past the 2000-
+    //      char cutoff and so never appeared in the diff or snippet.
+    //
+    //   2. extractSnippetClientSide received the whole section (often starting
+    //      at the heading) and picked the first sentence instead of the one
+    //      containing the change, showing irrelevant text in the review card.
+    //
+    // For deletion changes Word's paragraph.text never includes the deleted
+    // text, so we append it to the full paragraph before searching, giving
+    // buildInlineDiff a string it can locate the change text inside.
+
+    return rawEntries.flatMap((entry) => {
+      const { id, date, changeText, isDeletion } = entry;
+      const section = entry.section;
+
       if (!section || !section.sectionNumber) {
-        console.warn("  ⚠ DROPPING — could not attribute to any real section");
-        console.groupEnd();
+        console.warn(`[getTrackedChanges] DROPPING "${changeText.slice(0, 60)}" — no section found`);
         return [];
       }
 
-      console.log(`  ✅ Final: § ${section.sectionNumber} | context: "${section.paragraphContext?.slice(0, 80)}"`);
-      console.groupEnd();
+      // Full paragraph text returned by the helpers (no slice limit).
+      let fullParagraph = section.paragraphContext;
+
+      // For deletions: deleted text is absent from paragraph.text.
+      // Append it so extractCenteredWindow can anchor on it.
+      if (isDeletion && changeText.trim().length > 0) {
+        const normCtx  = normalizeForMatch(fullParagraph);
+        const normHead = normalizeForMatch(changeText.slice(0, 60));
+        if (normHead.length >= 4 && !normCtx.includes(normHead)) {
+          fullParagraph = fullParagraph ? fullParagraph + " " + changeText : changeText;
+        }
+      }
+
+      // Extract a ~800-char window centered on the change text.
+      const paragraphContext = extractCenteredWindow(fullParagraph, changeText);
+
+      console.log(`[getTrackedChanges] § ${section.sectionNumber} | "${changeText.slice(0, 40)}" → ctx: "${paragraphContext.slice(0, 80)}"`);
 
       return [{
         id,
-        type: String(c.type ?? ""),
-        author: c.author ?? "",
+        type: String(entry.c.type ?? ""),
+        author: entry.c.author ?? "",
         date,
         text: changeText,
         sectionTitle: section.sectionTitle,
         sectionNumber: section.sectionNumber,
-        paragraphContext: section.paragraphContext,
+        paragraphContext,
+        rawParagraphText: section.paragraphContext, // unmodified full paragraph for unified diff grouping
       } satisfies TrackedChangeInfo];
     });
   });
@@ -267,13 +401,78 @@ function normalizeForMatch(s: string): string {
     .trim();
 }
 
+// ─── Per-change centered window extraction ────────────────────────────────────
+//
+// paragraphContext stored on each TrackedChangeInfo is a ~800-char window
+// centered on the change text within the full paragraph.  This ensures:
+//   • Changes deep in long paragraphs (e.g. PAYMENT §6) are not cut off.
+//   • Each change in the same paragraph gets its OWN context snippet, not
+//     the same leading-edge slice shared by all changes.
+//   • buildInlineDiff can always find the change text within the window.
+//
+// For deletion changes the deleted text is not in paragraph.text, so it is
+// appended before the window search so the anchor search can still locate it
+// (the appended text will be the highlight target for <del> rendering).
+
+export function extractCenteredWindow(
+  fullParagraph: string,
+  changeText: string,
+  windowRadius = 400
+): string {
+  if (!fullParagraph) return "";
+
+  const normPara   = normalizeForMatch(fullParagraph);
+  const normNeedle = normalizeForMatch(changeText.trim());
+
+  // ── Find the anchor position of the change text ───────────────────────────
+  let anchorPos = -1;
+
+  if (normNeedle.length >= 4) {
+    anchorPos = normPara.indexOf(normNeedle);
+
+    // Fuzzy: try progressively shorter leading prefixes (handles encoding
+    // differences that survive normalization, e.g. soft-hyphens inside tokens)
+    if (anchorPos === -1 && normNeedle.length > 20) {
+      for (const prefixLen of [60, 40, 20, 10]) {
+        if (normNeedle.length <= prefixLen) continue;
+        const anchor = normPara.indexOf(normNeedle.slice(0, prefixLen));
+        if (anchor !== -1) { anchorPos = anchor; break; }
+      }
+    }
+  }
+
+  // No anchor found (deleted text absent from paragraph.text):
+  // return the full paragraph so the caller can decide what to show.
+  if (anchorPos === -1) return fullParagraph;
+
+  // ── Map normalized anchor back to original string position ───────────────
+  const origAnchor = normToOriginalPos(fullParagraph, anchorPos);
+
+  // ── Expand outward to sentence boundaries within the radius ──────────────
+  const rawStart = Math.max(0, origAnchor - windowRadius);
+  const rawEnd   = Math.min(fullParagraph.length, origAnchor + normNeedle.length + windowRadius);
+
+  // Trim to a sentence boundary so we don't start/end mid-word
+  const beforeCut = fullParagraph.lastIndexOf(". ", origAnchor);
+  const afterCut  = fullParagraph.indexOf(". ", origAnchor + normNeedle.length);
+
+  const start = beforeCut !== -1 && beforeCut >= rawStart ? beforeCut + 2 : rawStart;
+  const end   = afterCut  !== -1 && afterCut  <= rawEnd   ? afterCut  + 1 : rawEnd;
+
+  return fullParagraph.slice(start, end).trim();
+}
+
 // Client-side snippet extractor — fallback when /api/cluster is unavailable
 // or returns an invalid snippet.
 //
 // Uses multiple needle lengths so changes that span sentence boundaries are
 // found in BOTH sentences. No hard character cap — always returns complete
 // sentences so buildInlineDiff can locate the full change text.
-function extractSnippetClientSide(paragraph: string, changes: TrackedChangeInfo[]): string {
+//
+// Exported so buildClusterDiffHtml in cards.ts can derive a per-paragraph
+// snippet rather than re-using the cluster-level paragraphText (which is
+// only valid for the first paragraph in multi-paragraph clusters).
+export function extractSnippetClientSide(paragraph: string, changes: TrackedChangeInfo[]): string {
   if (!paragraph) return "";
 
   const sentences = paragraph.split(/(?<=[.!?])\s+/);
@@ -589,6 +788,98 @@ export async function addWordCommentOnRedline(args: {
   });
 }
 
+// ─── Cluster-spanning comment insertion ───────────────────────────────────────
+//
+// Inserts a single Word comment that spans the full range of ALL tracked
+// changes in the cluster (from the start of the first change to the end of
+// the last), so the comment appears anchored to the entire redlined region
+// rather than just the first change's text.
+//
+// Strategy:
+//   1. Load all tracked changes from the document.
+//   2. Match them to the cluster's change IDs.
+//   3. Get each matching change's Range and union them via expandTo.
+//   4. Insert the comment on the unioned range.
+//   5. Fall back to addWordCommentOnRedline if getRange() is unavailable or
+//      no IDs match (older Word versions).
+
+export async function addCommentOnCluster(args: {
+  changeIds: string[];
+  commentText: string;
+  // fallback fields used if the Revision.range approach fails:
+  firstChangeText: string;
+  paragraphContext: string;
+  sectionTitle: string;
+  sectionNumber: string;
+}): Promise<CommentResult> {
+  const commentText = (args.commentText ?? "").trim();
+  if (!commentText) return { ok: false, error: "Missing commentText" };
+
+  if (!args.changeIds.length) {
+    return addWordCommentOnRedline({
+      changeText: args.firstChangeText,
+      paragraphContext: args.paragraphContext,
+      sectionTitle: args.sectionTitle,
+      sectionNumber: args.sectionNumber,
+      commentText,
+    });
+  }
+
+  return Word.run(async (context) => {
+    const body = context.document.body;
+
+    // ── Step 1: load scalars + navigate to range in one load call ────────────
+    // Use the nested path "items/range/text" to tell Office JS to also hydrate
+    // the range navigation property on each revision in the same sync.
+    // Some revision types (formatting, paragraph property) have no text range —
+    // we guard against that with null checks before using .range.
+    const revisions = body.getTrackedChanges();
+    revisions.load("items/id,items/index,items/range/text");
+    await context.sync();
+
+    // ── Step 2: find matching revisions that also have a valid range ──────────
+    const idSet = new Set(args.changeIds);
+    const matching = revisions.items.filter((rev) => {
+      const raw = rev as unknown as Record<string, unknown>;
+      const id  = typeof raw["id"] === "string" ? raw["id"] : String(raw["id"] ?? "");
+      // Only keep revisions that matched an ID AND have a usable range object.
+      // Formatting/property revisions may have range === undefined or null.
+      return idSet.has(id) && rev.range != null;
+    });
+
+    if (matching.length === 0) {
+      console.warn("[addCommentOnCluster] No revisions with ranges matched — falling back to text search");
+      return addWordCommentOnRedline({
+        changeText: args.firstChangeText,
+        paragraphContext: args.paragraphContext,
+        sectionTitle: args.sectionTitle,
+        sectionNumber: args.sectionNumber,
+        commentText,
+      });
+    }
+
+    // ── Step 3: sort by document index, union ranges first → last ────────────
+    const sorted = [...matching].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+
+    let unionRange: Word.Range = sorted[0].range;
+    for (let i = 1; i < sorted.length; i++) {
+      // revision.range is only the changed text — not the whole paragraph —
+      // so expandTo spans exactly the cluster edits, nothing more.
+      unionRange = unionRange.expandTo(sorted[i].range);
+    }
+
+    // ── Step 4: insert the comment on the exact revision-spanning range ───────
+    unionRange.insertComment(commentText);
+    await context.sync();
+
+    console.log(
+      `[addCommentOnCluster] Comment inserted on ${sorted.length} revision(s), ` +
+      `index ${sorted[0].index} → ${sorted[sorted.length - 1].index}`
+    );
+    return { ok: true, matches: sorted.length, usedIndex: 0 };
+  });
+}
+
 export async function addWordCommentByAnchor(args: {
   anchorText: string;
   commentText: string;
@@ -677,7 +968,7 @@ function findSectionForText(
         return {
           sectionNumber: section.sectionNumber,
           sectionTitle: section.sectionTitle,
-          paragraphContext: para.slice(0, 2000),
+          paragraphContext: para, // full paragraph — caller will extract a centered window
         };
       }
     }
@@ -700,7 +991,7 @@ function findSectionByPosition(
         return {
           sectionNumber: section.sectionNumber,
           sectionTitle: section.sectionTitle,
-          paragraphContext: paraTexts[i].slice(0, 2000),
+          paragraphContext: paraTexts[i], // full paragraph — caller will extract a centered window
         };
       }
     }

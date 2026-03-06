@@ -7,6 +7,7 @@ import {
   getRedlinedSections,
   readWordBodyText,
   addWordCommentOnRedline,
+  addCommentOnCluster,
   clusterSectionSemantically,
 } from "./tools/wordTools";
 import type { RedlineCluster } from "./tools/wordTools";
@@ -180,12 +181,16 @@ export async function handleCardAction(
     const firstChange = cluster?.changes[0];
     const isDeletion = firstChange?.type?.toLowerCase().includes("delete");
 
-    const result = await addWordCommentOnRedline({
-      changeText:       isDeletion ? "" : (firstChange?.text ?? ""),
+    // Use addCommentOnCluster so the Word comment spans the full range of
+    // ALL tracked changes in the cluster (first to last), not just the
+    // first change's text. Falls back to text-search if getRange() fails.
+    const result = await addCommentOnCluster({
+      changeIds:        cluster?.changes.map((c) => c.id) ?? [],
+      commentText,
+      firstChangeText:  isDeletion ? "" : (firstChange?.text ?? ""),
       paragraphContext: cluster?.paragraphText ?? firstChange?.paragraphContext ?? "",
       sectionTitle:     rec.sectionTitle,
       sectionNumber:    rec.sectionNumber ?? "",
-      commentText,
     });
 
     setLoading(false);
@@ -214,6 +219,7 @@ export async function handleCardAction(
     const notifyPrompt =
       `[SYSTEM] The user ${actionLabel} the changes in section "${rec.sectionTitle}". ` +
       `The Word comment has already been written — do NOT call add_word_comment again. ` +
+      `Respond with a SHORT plain-English confirmation only — do NOT output JSON. ` +
       (remaining > 0
         ? `There are ${remaining} cluster(s) remaining. Confirm what was done in one sentence and ask if they want to continue.`
         : `That was the last cluster. Confirm and tell them the review is complete.`);
@@ -223,7 +229,20 @@ export async function handleCardAction(
     session.conversationId = conversationId;
     setLoading(false);
 
-    if (confirmReply) appendAssistantBubble(confirmReply);
+    if (confirmReply) {
+      // Guard: if the model echoed back JSON instead of a confirmation sentence,
+      // suppress it and show a safe fallback so the raw object never reaches the UI.
+      const looksLikeJson = confirmReply.trimStart().startsWith("{") || confirmReply.trimStart().startsWith("```");
+      if (looksLikeJson) {
+        console.warn("[review] notifyPrompt response was JSON — suppressing and using fallback");
+        const fallback = remaining > 0
+          ? `Changes in "${rec.sectionTitle}" ${actionLabel}. Ready for the next cluster when you are.`
+          : `Changes in "${rec.sectionTitle}" ${actionLabel}. Review complete — all clusters have been assessed.`;
+        appendAssistantBubble(fallback);
+      } else {
+        appendAssistantBubble(confirmReply);
+      }
+    }
 
   } catch (err) {
     console.error("[review] Action error:", err);
