@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@azure/ai-projects": "^1.0.1",
+    "@azure/ai-agents": "1.0.0",
     "@azure/identity": "^4.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.0.0",

@@ -26,12 +26,9 @@
     "watch": "webpack --mode development --watch"
   },
   "dependencies": {
-    "@azure/ai-projects": "^1.0.1",
     "@azure/core-auth": "^1.10.1",
-    "@azure/identity": "^4.13.0",
     "@azure/msal-browser": "^5.2.0",
     "core-js": "^3.36.0",
-    "cors": "^2.8.6",
     "regenerator-runtime": "^0.14.1"
   },
   "devDependencies": {

@@ -10,7 +10,9 @@
   <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/icon-64.png"/>
   <SupportUrl DefaultValue="https://www.contoso.com/help"/>
   <AppDomains>
-    <AppDomain>https://www.contoso.com</AppDomain>
+    <AppDomain>https://appsforoffice.microsoft.com</AppDomain>
+    <AppDomain>https://localhost:3000</AppDomain>
+    <AppDomain>https://localhost:3001</AppDomain>
   </AppDomains>
   <Hosts>
     <Host Name="Document"/>

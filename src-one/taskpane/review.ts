@@ -1,14 +1,19 @@
 // src-one/taskpane/review.ts
 
-import { session } from "./state/session";
+import { session, resetSession } from "./state/session";
+import { registerAdvanceCallback, registerCommentWrittenCallback } from "./tools/dispatchTools";
 import { sendPrompt, primeThread } from "./api/client";
-import { getRedlinedSections, readWordBodyText, addWordCommentOnRedline } from "./tools/wordTools";
-import type { RedlinedSection } from "./tools/wordTools";
+import {
+  getRedlinedSections,
+  readWordBodyText,
+  addWordCommentOnRedline,
+  clusterSectionSemantically,
+} from "./tools/wordTools";
+import type { RedlineCluster } from "./tools/wordTools";
 import { appendAssistantBubble, appendSysMsg, setLoading } from "./ui/chat";
 import {
   appendScanSummary,
   appendStartReviewButton,
-  appendNextSectionButton,
   appendAnalysisCard,
   setCardDisabled,
   tryParseRecommendation,
@@ -18,16 +23,21 @@ import { showEl, setText, getDocumentName } from "./ui/dom";
 
 // ─── Initialization & scan ────────────────────────────────────────────────────
 
-// Guard: Office.onReady can fire multiple times during hot-reload / iframe reuse.
-// We only want to run the scan once per add-in lifetime.
-let scanStarted = false;
-
 export async function initializeScan(): Promise<void> {
-  if (scanStarted) {
-    console.warn("[initializeScan] Already started — skipping duplicate call.");
-    return;
-  }
-  scanStarted = true;
+  resetSession();
+
+  registerAdvanceCallback(analyzeCurrentCluster);
+
+  registerCommentWrittenCallback(() => {
+    const cardIndex = session.currentClusterIndex;
+    markProgress(cardIndex, "done");
+    session.currentClusterIndex++;
+    const totalChangesReviewed = session.allClusters
+      .slice(0, session.currentClusterIndex)
+      .reduce((sum, cl) => sum + cl.changes.length, 0);
+    updateProgressLabel(session.currentClusterIndex, session.allClusters.length, totalChangesReviewed);
+    setCardDisabled(cardIndex, true);
+  });
 
   const [redlinedSections, bodyText] = await Promise.all([
     getRedlinedSections(),
@@ -37,9 +47,6 @@ export async function initializeScan(): Promise<void> {
 
   appendSysMsg("Reading contract and initialising agent…");
 
-  // primeThread adds the document text to a fresh thread WITHOUT starting a run.
-  // This means the thread is immediately idle and the first /api/chat call
-  // (the section analysis) will never hit a "run active" race condition.
   try {
     const conversationId = await primeThread(
       `The following is the full text of the contract document the user will be reviewing. ` +
@@ -54,7 +61,21 @@ export async function initializeScan(): Promise<void> {
     console.warn("[initializeScan] Could not prime thread:", err);
   }
 
-  const totalChanges = session.redlinedSections.reduce((sum, s) => sum + s.changes.length, 0);
+  // ── Semantic clustering via /api/cluster (Foundry model, no agent thread) ───
+  appendSysMsg("Grouping tracked changes into review clusters…");
+
+  const clusterArrays = await Promise.all(
+    redlinedSections.map((s) =>
+      clusterSectionSemantically(s.sectionNumber, s.sectionTitle, s.changes)
+    )
+  );
+  session.allClusters = clusterArrays.flat();
+
+  console.log("[clusters]", session.allClusters.map(
+    (c) => `[${c.sectionNumber}] ${c.sectionTitle} (${c.changes.length} edits)`
+  ));
+
+  const totalChanges = session.allClusters.reduce((sum, cl) => sum + cl.changes.length, 0);
 
   document.getElementById("initial-loading")?.remove();
 
@@ -64,9 +85,9 @@ export async function initializeScan(): Promise<void> {
   setText("stat-total", String(totalChanges));
   setText("stat-reviewed", "0");
 
-  buildProgressTrack(session.redlinedSections.length);
+  buildProgressTrack(session.allClusters.length);
 
-  if (session.redlinedSections.length === 0) {
+  if (session.allClusters.length === 0) {
     appendSysMsg("No tracked changes found in this document.");
     appendAssistantBubble(
       "This document has no tracked changes. Feel free to ask me anything about its contents."
@@ -74,32 +95,32 @@ export async function initializeScan(): Promise<void> {
     return;
   }
 
-  appendScanSummary(session.redlinedSections);
-  appendStartReviewButton(session.redlinedSections.length, totalChanges, startReview);
+  appendScanSummary(session.redlinedSections, session.allClusters);
+  appendStartReviewButton(session.allClusters.length, totalChanges, startReview);
 }
 
-// ─── Section-by-section review ────────────────────────────────────────────────
+// ─── Cluster-by-cluster review ────────────────────────────────────────────────
 
 async function startReview(): Promise<void> {
-  if (session.redlinedSections.length === 0) return;
-  session.currentSectionIndex = 0;
-  await analyzeCurrentSection();
+  if (session.allClusters.length === 0) return;
+  session.currentClusterIndex = 0;
+  await analyzeCurrentCluster();
 }
 
-export async function analyzeCurrentSection(): Promise<void> {
-  const sections = session.redlinedSections;
+export async function analyzeCurrentCluster(): Promise<void> {
+  const clusters = session.allClusters;
 
-  if (session.currentSectionIndex >= sections.length) {
-    appendSysMsg("All sections reviewed.");
-    appendAssistantBubble("Review complete — all redlined sections have been assessed.");
+  if (session.currentClusterIndex >= clusters.length) {
+    appendSysMsg("All clusters reviewed.");
+    appendAssistantBubble("Review complete — all redlined clusters have been assessed.");
     return;
   }
 
-  const section = sections[session.currentSectionIndex];
-  markProgress(session.currentSectionIndex, "active");
+  const cluster = clusters[session.currentClusterIndex];
+  markProgress(session.currentClusterIndex, "active");
   setLoading(true);
 
-  const prompt = buildSectionPrompt(section, session.currentSectionIndex, sections.length);
+  const prompt = buildClusterPrompt(cluster, session.currentClusterIndex, clusters.length);
   const { reply, conversationId } = await sendPrompt(prompt, session.conversationId);
   session.conversationId = conversationId;
   setLoading(false);
@@ -110,19 +131,23 @@ export async function analyzeCurrentSection(): Promise<void> {
   if (parsed) {
     session.lastRecommendation = {
       ...parsed,
-      changeId: section.changes[0]?.id,
-      allChangeIds: section.changes.map((c) => c.id),
+      changeId: cluster.changes[0]?.id,
+      allChangeIds: cluster.changes.map((c) => c.id),
     };
-    appendAnalysisCard(session.lastRecommendation, session.currentSectionIndex, handleCardAction);
+    appendAnalysisCard(
+      session.lastRecommendation,
+      session.currentClusterIndex,
+      handleCardAction,
+      cluster
+    );
   } else {
     appendAssistantBubble(reply);
-    appendNextSectionButton(session.currentSectionIndex, sections.length, analyzeCurrentSection);
   }
 }
 
 // ─── Card action handler ──────────────────────────────────────────────────────
 
-async function handleCardAction(
+export async function handleCardAction(
   action: "accept" | "reject" | "insertAlt",
   cardIndex: number,
   altIndex?: number
@@ -137,31 +162,27 @@ async function handleCardAction(
     let sysMessage: string;
 
     if (action === "accept") {
-      commentText = `AI Review: ACCEPT — ${rec.commentDraft ?? rec.reasoning}`;
+      commentText = `AI: ACCEPT CHANGES`;
       sysMessage  = `✓ Accept comment added to ${rec.sectionTitle}.`;
-
     } else if (action === "reject") {
-      commentText = `AI Review: REJECT — ${rec.reasoning}`;
+      commentText = `AI: REJECT CHANGES`;
       sysMessage  = `✗ Reject comment added to ${rec.sectionTitle}.`;
-
     } else {
       const alt = rec.alternativeLanguageOptions?.[altIndex ?? 0];
-      if (!alt) {
-        setCardDisabled(cardIndex, false);
-        return;
-      }
+      if (!alt) { setCardDisabled(cardIndex, false); return; }
       commentText = `AI Review: ALTERNATIVE — ${alt.label}: "${alt.text}"`;
       sysMessage  = `✏ Alternative ${(altIndex ?? 0) + 1} comment added to ${rec.sectionTitle}.`;
     }
 
     setLoading(true);
 
-    const section = session.redlinedSections[cardIndex];
-    const firstChange = section?.changes[0];
+    const cluster = session.allClusters[cardIndex];
+    const firstChange = cluster?.changes[0];
+    const isDeletion = firstChange?.type?.toLowerCase().includes("delete");
 
     const result = await addWordCommentOnRedline({
-      changeText:       firstChange?.text             ?? "",
-      paragraphContext: firstChange?.paragraphContext  ?? rec.originalText ?? "",
+      changeText:       isDeletion ? "" : (firstChange?.text ?? ""),
+      paragraphContext: cluster?.paragraphText ?? firstChange?.paragraphContext ?? "",
       sectionTitle:     rec.sectionTitle,
       sectionNumber:    rec.sectionNumber ?? "",
       commentText,
@@ -170,43 +191,39 @@ async function handleCardAction(
     setLoading(false);
 
     if (!result.ok) {
-      throw new Error(
-        `Could not anchor comment in section "${rec.sectionTitle}". ` +
-          `Error: ${result.error ?? "unknown"}`
-      );
+      throw new Error(`Could not anchor comment in "${rec.sectionTitle}". Error: ${result.error ?? "unknown"}`);
     }
 
-    console.log(`[handleCardAction] Comment inserted — matches: ${result.matches}, used index: ${result.usedIndex}`);
-
     appendSysMsg(sysMessage);
-
     markProgress(cardIndex, "done");
-    session.currentSectionIndex++;
 
-    const totalChangesReviewed = session.redlinedSections
-      .slice(0, session.currentSectionIndex)
-      .reduce((sum, s) => sum + s.changes.length, 0);
+    const nextIndex = cardIndex + 1;
+    session.currentClusterIndex = nextIndex;
 
-    updateProgressLabel(
-      session.currentSectionIndex,
-      session.redlinedSections.length,
-      totalChangesReviewed
-    );
+    const totalChangesReviewed = session.allClusters
+      .slice(0, nextIndex)
+      .reduce((sum, cl) => sum + cl.changes.length, 0);
+    updateProgressLabel(nextIndex, session.allClusters.length, totalChangesReviewed);
 
-    setTimeout(() => {
-      if (session.currentSectionIndex < session.redlinedSections.length) {
-        appendNextSectionButton(
-          session.currentSectionIndex,
-          session.redlinedSections.length,
-          analyzeCurrentSection
-        );
-      } else {
-        appendSysMsg("All sections reviewed.");
-        appendAssistantBubble(
-          "Review complete — all redlined sections have been assessed. Feel free to ask any follow-up questions."
-        );
-      }
-    }, 600);
+    const remaining = session.allClusters.length - nextIndex;
+    const actionLabel =
+      action === "accept" ? "accepted" :
+      action === "reject" ? "rejected" :
+      `inserted Alternative ${String.fromCharCode(65 + (altIndex ?? 0))}`;
+
+    const notifyPrompt =
+      `[SYSTEM] The user ${actionLabel} the changes in section "${rec.sectionTitle}". ` +
+      `The Word comment has already been written — do NOT call add_word_comment again. ` +
+      (remaining > 0
+        ? `There are ${remaining} cluster(s) remaining. Confirm what was done in one sentence and ask if they want to continue.`
+        : `That was the last cluster. Confirm and tell them the review is complete.`);
+
+    setLoading(true);
+    const { reply: confirmReply, conversationId } = await sendPrompt(notifyPrompt, session.conversationId);
+    session.conversationId = conversationId;
+    setLoading(false);
+
+    if (confirmReply) appendAssistantBubble(confirmReply);
 
   } catch (err) {
     console.error("[review] Action error:", err);
@@ -216,21 +233,21 @@ async function handleCardAction(
   }
 }
 
-// ─── Prompt builder ───────────────────────────────────────────────────────────
+// ─── Prompt builders ──────────────────────────────────────────────────────────
 
-function buildSectionPrompt(section: RedlinedSection, index: number, total: number): string {
-  const changeList = section.changes
-    .map(
-      (c, i) =>
-        `  Redline ${i + 1}: [${c.type} by ${c.author}] "${c.text?.slice(0, 120) ?? "unknown"}"`
-    )
+function buildClusterPrompt(cluster: RedlineCluster, index: number, total: number): string {
+  const changeList = cluster.changes
+    .map((c, i) => `  Edit ${i + 1}: [${c.type} by ${c.author}] "${c.text?.slice(0, 120) ?? "unknown"}"`)
     .join("\n");
 
   return (
-    `Please analyse Section ${index + 1} of ${total}:\n` +
-    `Section: ${section.sectionTitle}\n` +
-    `Section context: ${section.sectionContext?.slice(0, 400) ?? ""}\n\n` +
-    `This section contains ${section.changes.length} tracked change${section.changes.length !== 1 ? "s" : ""}:\n` +
+    `[SYSTEM] Analyse the following tracked-change cluster and respond with ONLY a raw JSON object ` +
+    `(no markdown fences, no preamble). Use the analysis response format from your instructions.\n\n` +
+    `Cluster ${index + 1} of ${total}:\n` +
+    `Section: ${cluster.sectionTitle}\n` +
+    `Paragraph: ${cluster.paragraphText.slice(0, 400)}\n\n` +
+    `This cluster contains ${cluster.changes.length} edit${cluster.changes.length !== 1 ? "s" : ""} ` +
+    `to the same paragraph:\n` +
     changeList
   );
 }

@@ -1,9 +1,6 @@
-<!-- Copyright (c) Microsoft Corporation. All rights reserved. Licensed under the MIT License. -->
-<!-- This file shows how to design a first-run page that provides a welcome screen to the user about the features of the add-in. -->
- 
 <!DOCTYPE html>
 <html>
- 
+
 <head>
     <meta http-equiv="Content-Security-Policy"
       content="
@@ -16,61 +13,46 @@
     <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Contract Redlining</title>
- 
-    <!-- Office JavaScript API -->
+
     <script type="text/javascript" src="https://appsforoffice.microsoft.com/lib/1.1/hosted/office.js"></script>
- 
-    <!-- For more information on Fluent UI, visit https://developer.microsoft.com/fluentui#/. -->
     <link rel="stylesheet" href="https://static2.sharepointonline.com/files/fabric/office-ui-fabric-core/11.0.0/css/fabric.min.css"/>
- 
-    <!-- Template styles -->
     <link href="taskpane.css" rel="stylesheet" type="text/css" />
 </head>
- 
+
 <body>
-<!-- Header (visible) -->
- <header class="header">
+
+<header class="header">
     <div class="header-title">Contract Redlining</div>
     <div class="header-subtitle">Redline your contract with AI</div>
 </header>
 
-<!--
-    Doc Status Bar
-    Stats of redlined sections & reviewed sections
--->
+<!-- FIX 1: was id="doc-status-bar" (duplicate). Now correctly "doc-status-bar" (first use) -->
 <div class="doc-status" id="doc-status-bar" style="display:none">
-    <div class="doc-name" id="doc-name-text"> Loading...</div>
+    <div class="doc-name" id="doc-name-text">Loading...</div>
     <div class="doc-stats">
         <span><strong id="stat-total">--</strong> redlines</span>
         <span><strong id="stat-reviewed">--</strong> reviewed</span>
     </div>
 </div>
 
-<!--
-    Progress Checker
-    Shows progress bar of how many sections need to be redlined and how many have been redlined
--->
-<div class="progress-checker" id="doc-status-bar" style="display:none;">
+<!-- FIX 2: was id="doc-status-bar" (duplicate) — corrected to "progress-section" to match review.ts showEl("progress-section") -->
+<!-- FIX 3: inner div was id="progressCheck" — corrected to "progressTrack" to match progress.ts buildProgressTrack() -->
+<div class="progress-checker" id="progress-section" style="display:none;">
     <div class="progress-header">
         <span>Section Progress</span>
         <span id="progress-label">--</span>
     </div>
-    <div class="progress-check" id="progressCheck"></div>
+    <div class="progress-track" id="progressTrack"></div>
 </div>
-<!--
-    Main App Body
--->
+
     <main id="app-body" style="display:none;">
- 
-        <!-- Chat Window -->
         <div id="chat-window">
             <div class="loading" id="initial-loading">
                 <div class="spinner"></div>
                 <p>Loading Contract Redlining...</p>
             </div>
         </div>
- 
-        <!-- Input Row-->
+
         <div class="input-row">
             <div class="input-wrap">
                 <textarea id="agent-input" placeholder="Ask about this contract… (Enter to send)" rows="1"
@@ -85,8 +67,7 @@
                 </svg>
             </button>
         </div>
- 
     </main>
- 
+
 </body>
 </html>

@@ -81,12 +81,13 @@ async function handleSendMessage(input: HTMLTextAreaElement): Promise<void> {
   appendUserBubble(text);
   input.value = "";
   autoResize(input);
-  setLoading(true);
 
+  // Send message to agent
+  setLoading(true);
   const { reply, conversationId } = await sendPrompt(text, session.conversationId);
   session.conversationId = conversationId;
-
   setLoading(false);
+
   if (reply) appendAssistantBubble(reply);
 }
 

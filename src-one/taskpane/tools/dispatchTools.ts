@@ -1,8 +1,4 @@
 // src-one/taskpane/tools/dispatchTools.ts
-//
-// Executes tool calls received from the backend.
-// Only three tools are registered — there are no resolve/accept/reject tools
-// because the add-in never modifies tracked changes directly.
 
 import { readWordBodyText, addWordCommentByAnchor, getTrackedChanges } from "./wordTools";
 
@@ -17,6 +13,28 @@ export interface ToolCall {
 export interface ToolResult {
   tool_call_id: string;
   output: string; // JSON string
+}
+
+let _advanceCallback: (() => Promise<void>) | null = null;
+
+// Called by review.ts after all functions are defined.
+export function registerAdvanceCallback(cb: () => Promise<void>): void {
+  _advanceCallback = cb;
+}
+
+// Called by client.ts AFTER the active run is closed, so the thread is free.
+export async function triggerAdvance(): Promise<void> {
+  if (_advanceCallback) {
+    await _advanceCallback();
+  }
+}
+
+// Called by client.ts when add_word_comment fires via chat (not via button).
+// review.ts registers this to keep session state in sync.
+let _commentWrittenCallback: (() => void) | null = null;
+
+export function registerCommentWrittenCallback(cb: () => void): void {
+  _commentWrittenCallback = cb;
 }
 
 export async function executeToolCall(toolCall: ToolCall): Promise<ToolResult> {
@@ -42,7 +60,15 @@ export async function executeToolCall(toolCall: ToolCall): Promise<ToolResult> {
       case "add_word_comment": {
         const result = await addWordCommentByAnchor(args);
         console.log("✅ add_word_comment —", result);
+        // Notify review.ts so it can increment the index and update progress.
+        _commentWrittenCallback?.();
         return { tool_call_id, output: JSON.stringify(result) };
+      }
+
+      case "advance_to_next_cluster": {
+        // Handled by client.ts directly — should not reach here.
+        console.log("✅ advance_to_next_cluster — handled by client.ts");
+        return { tool_call_id, output: JSON.stringify({ ok: true }) };
       }
 
       default:
