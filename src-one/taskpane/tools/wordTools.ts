@@ -38,7 +38,10 @@ export interface CommentResult {
   error?: string;
 }
 
-const SECTION_HEADING_RE = /^([A-Z][A-Z\s&,\/()'".-]{2,}[A-Z])\./;
+// Matches section headings that may be prefixed with a number like "5.0 PAYMENT."
+// The numeric prefix is optional — headings without numbers (e.g. "ATTACHMENT A.")
+// are also matched. Capture group 1 is always just the title text, e.g. "PAYMENT".
+const SECTION_HEADING_RE = /^(?:\d+(?:\.\d+)*\.?\s+)?([A-Z][A-Z\s&,\/()'".-]{2,}[A-Z])\./;
 
 // ─── Read ─────────────────────────────────────────────────────────────────────
 
@@ -60,7 +63,36 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
 
     const changes = body.getTrackedChanges();
     changes.load("items/id,items/type,items/date,items/author,items/text");
+
+    // ── DIAGNOSTIC: getReviewedText on body ───────────────────────────────────
+    // Queue both reviewed text calls alongside the other loads so they resolve
+    // in the same sync round trip.
+    const reviewedCurrent  = (body as any).getReviewedText("current")  as OfficeExtension.ClientResult<string>;
+    const reviewedOriginal = (body as any).getReviewedText("original") as OfficeExtension.ClientResult<string>;
+
     await context.sync();
+
+    try {
+      const currText = reviewedCurrent.value ?? "";
+      const origText = reviewedOriginal.value ?? "";
+      console.group("[DIAGNOSTIC] body.getReviewedText");
+      console.log("--- current (accept all) ---");
+      console.log(currText.slice(0, 3000));
+      console.log("--- original (reject all) ---");
+      console.log(origText.slice(0, 3000));
+      console.log(`[diff] current length=${currText.length} | original length=${origText.length} | same=${currText === origText}`);
+      console.groupEnd();
+    } catch (err) {
+      console.warn("[DIAGNOSTIC] getReviewedText not available on this Word version:", err);
+    }
+
+    const activeItems = changes.items;
+
+    console.group("[getTrackedChanges] Raw changes from Word:", activeItems.length);
+    for (const c of activeItems) {
+      console.log(`  [${c.type}] text: "${(c.text ?? "").slice(0, 60)}" | author: "${c.author}"`);
+    }
+    console.groupEnd();
 
     const paraTexts = paragraphs.items.map((p) => p.text ?? "");
     const sectionEntries = buildSectionMap(paraTexts);
@@ -84,8 +116,8 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
       }
     }
 
-    console.group("[getTrackedChanges] Raw changes from Word:", changes.items.length);
-    for (const c of changes.items) {
+    console.group("[getTrackedChanges] Raw changes from Word:", activeItems.length);
+    for (const c of activeItems) {
       console.log(`  [${c.type}] text: "${c.text}" | author: "${c.author}"`);
     }
     console.groupEnd();
@@ -112,7 +144,7 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
       isDeletion: boolean;
     };
 
-    const rawEntries: RawChangeEntry[] = changes.items.map((c) => {
+    const rawEntries: RawChangeEntry[] = activeItems.map((c) => {
       const raw = c as unknown as Record<string, unknown>;
       const id = typeof raw["id"] === "string" ? raw["id"] : String(raw["id"] ?? "");
 
@@ -203,22 +235,6 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
     }
 
     // ── Finalise: extract per-change centered paragraphContext ───────────────
-    //
-    // Each change gets its OWN context window centered on its change text.
-    // This fixes two issues that the old slice(0,2000) approach caused:
-    //
-    //   1. All changes in the same paragraph shared the same leading-edge
-    //      context — changes deep in a long paragraph (e.g. "ten percent (10%)"
-    //      or the "Notwithstanding" clause in §6 PAYMENT) were past the 2000-
-    //      char cutoff and so never appeared in the diff or snippet.
-    //
-    //   2. extractSnippetClientSide received the whole section (often starting
-    //      at the heading) and picked the first sentence instead of the one
-    //      containing the change, showing irrelevant text in the review card.
-    //
-    // For deletion changes Word's paragraph.text never includes the deleted
-    // text, so we append it to the full paragraph before searching, giving
-    // buildInlineDiff a string it can locate the change text inside.
 
     return rawEntries.flatMap((entry) => {
       const { id, date, changeText, isDeletion } = entry;
@@ -229,11 +245,8 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
         return [];
       }
 
-      // Full paragraph text returned by the helpers (no slice limit).
       let fullParagraph = section.paragraphContext;
 
-      // For deletions: deleted text is absent from paragraph.text.
-      // Append it so extractCenteredWindow can anchor on it.
       if (isDeletion && changeText.trim().length > 0) {
         const normCtx  = normalizeForMatch(fullParagraph);
         const normHead = normalizeForMatch(changeText.slice(0, 60));
@@ -242,7 +255,6 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
         }
       }
 
-      // Extract a ~800-char window centered on the change text.
       const paragraphContext = extractCenteredWindow(fullParagraph, changeText);
 
       console.log(`[getTrackedChanges] § ${section.sectionNumber} | "${changeText.slice(0, 40)}" → ctx: "${paragraphContext.slice(0, 80)}"`);
@@ -256,7 +268,7 @@ export async function getTrackedChanges(): Promise<TrackedChangeInfo[]> {
         sectionTitle: section.sectionTitle,
         sectionNumber: section.sectionNumber,
         paragraphContext,
-        rawParagraphText: section.paragraphContext, // unmodified full paragraph for unified diff grouping
+        rawParagraphText: section.paragraphContext,
       } satisfies TrackedChangeInfo];
     });
   });
@@ -298,14 +310,6 @@ export async function getRedlinedSections(): Promise<RedlinedSection[]> {
 }
 
 // ─── Semantic clustering ──────────────────────────────────────────────────────
-//
-// POSTs to /api/cluster which calls the AzureOpenAI model directly.
-//
-// The backend now returns:
-//   { clusters: [{ indices: [0,2], snippet: "..." }, { indices: [1], snippet: "..." }] }
-//
-// snippet — AI-chosen 1-3 sentence verbatim substring of paragraphContext,
-//           used as paragraphText on the cluster for display in the review card.
 
 export async function clusterSectionSemantically(
   sectionNumber: string,
@@ -367,8 +371,6 @@ export async function clusterSectionSemantically(
     const clusterChanges = cl.indices.map((idx) => changes[idx]);
     const fullParagraph = clusterChanges[0].paragraphContext;
 
-    // Verify snippet using normalized comparison so curly-quote/dash differences
-    // between the AI response and paragraphContext don\'t cause false fallbacks.
     const snippetIsValid =
       cl.snippet.length > 0 &&
       normalizeForMatch(fullParagraph).includes(normalizeForMatch(cl.snippet));
@@ -388,8 +390,6 @@ export async function clusterSectionSemantically(
 }
 
 // Shared normalization for snippet validity checks and sentence-hit detection.
-// Mirrors the normalization in buildInlineDiff so quote/dash/whitespace
-// differences don\'t cause false mismatches.
 function normalizeForMatch(s: string): string {
   return s
     .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")
@@ -402,17 +402,6 @@ function normalizeForMatch(s: string): string {
 }
 
 // ─── Per-change centered window extraction ────────────────────────────────────
-//
-// paragraphContext stored on each TrackedChangeInfo is a ~800-char window
-// centered on the change text within the full paragraph.  This ensures:
-//   • Changes deep in long paragraphs (e.g. PAYMENT §6) are not cut off.
-//   • Each change in the same paragraph gets its OWN context snippet, not
-//     the same leading-edge slice shared by all changes.
-//   • buildInlineDiff can always find the change text within the window.
-//
-// For deletion changes the deleted text is not in paragraph.text, so it is
-// appended before the window search so the anchor search can still locate it
-// (the appended text will be the highlight target for <del> rendering).
 
 export function extractCenteredWindow(
   fullParagraph: string,
@@ -424,14 +413,11 @@ export function extractCenteredWindow(
   const normPara   = normalizeForMatch(fullParagraph);
   const normNeedle = normalizeForMatch(changeText.trim());
 
-  // ── Find the anchor position of the change text ───────────────────────────
   let anchorPos = -1;
 
   if (normNeedle.length >= 4) {
     anchorPos = normPara.indexOf(normNeedle);
 
-    // Fuzzy: try progressively shorter leading prefixes (handles encoding
-    // differences that survive normalization, e.g. soft-hyphens inside tokens)
     if (anchorPos === -1 && normNeedle.length > 20) {
       for (const prefixLen of [60, 40, 20, 10]) {
         if (normNeedle.length <= prefixLen) continue;
@@ -441,18 +427,13 @@ export function extractCenteredWindow(
     }
   }
 
-  // No anchor found (deleted text absent from paragraph.text):
-  // return the full paragraph so the caller can decide what to show.
   if (anchorPos === -1) return fullParagraph;
 
-  // ── Map normalized anchor back to original string position ───────────────
   const origAnchor = normToOriginalPos(fullParagraph, anchorPos);
 
-  // ── Expand outward to sentence boundaries within the radius ──────────────
   const rawStart = Math.max(0, origAnchor - windowRadius);
   const rawEnd   = Math.min(fullParagraph.length, origAnchor + normNeedle.length + windowRadius);
 
-  // Trim to a sentence boundary so we don't start/end mid-word
   const beforeCut = fullParagraph.lastIndexOf(". ", origAnchor);
   const afterCut  = fullParagraph.indexOf(". ", origAnchor + normNeedle.length);
 
@@ -462,16 +443,6 @@ export function extractCenteredWindow(
   return fullParagraph.slice(start, end).trim();
 }
 
-// Client-side snippet extractor — fallback when /api/cluster is unavailable
-// or returns an invalid snippet.
-//
-// Uses multiple needle lengths so changes that span sentence boundaries are
-// found in BOTH sentences. No hard character cap — always returns complete
-// sentences so buildInlineDiff can locate the full change text.
-//
-// Exported so buildClusterDiffHtml in cards.ts can derive a per-paragraph
-// snippet rather than re-using the cluster-level paragraphText (which is
-// only valid for the first paragraph in multi-paragraph clusters).
 export function extractSnippetClientSide(paragraph: string, changes: TrackedChangeInfo[]): string {
   if (!paragraph) return "";
 
@@ -486,7 +457,6 @@ export function extractSnippetClientSide(paragraph: string, changes: TrackedChan
     if (!fullText) continue;
     const normFull = normalizeForMatch(fullText);
 
-    // Try progressively shorter needles to catch changes spanning sentence boundaries
     const needles = [
       normFull,
       normFull.slice(0, 80),
@@ -544,17 +514,6 @@ export function clusterSection(
 }
 
 // ─── Inline diff rendering ────────────────────────────────────────────────────
-//
-// paragraphContext is captured from Word BEFORE changes are accepted, so both
-// inserted and deleted text are present in the paragraph string.
-//
-// We search the snippet (paragraphText) for ALL change text — both insertions
-// and deletions — and mark them inline:
-//   Insertions → <ins class="redline-ins">
-//   Deletions  → <del class="redline-del">
-//
-// If a change text is not found in the snippet (it may fall outside the
-// visible sentence window) it is silently skipped — no orphan blocks.
 
 export function buildInlineDiff(paragraphText: string, changes: TrackedChangeInfo[]): string {
   if (!paragraphText) return "";
@@ -565,18 +524,13 @@ export function buildInlineDiff(paragraphText: string, changes: TrackedChangeInf
     change: TrackedChangeInfo;
   }
 
-  // Normalize a string for comparison:
-  // Word uses curly quotes/apostrophes and various whitespace that may differ
-  // between paragraphContext (captured from the DOM) and change.text (from the
-  // tracked-change object). Flattening these lets substring search succeed even
-  // when encoding differs.
   function normalize(s: string): string {
     return s
-      .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")   // curly single quotes → '
-      .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')   // curly double quotes → "
-      .replace(/[\u2013\u2014]/g, "-")                            // en/em dash → -
-      .replace(/\u00A0/g, " ")                                    // non-breaking space → space
-      .replace(/\s+/g, " ")                                       // collapse whitespace
+      .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")
+      .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')
+      .replace(/[\u2013\u2014]/g, "-")
+      .replace(/\u00A0/g, " ")
+      .replace(/\s+/g, " ")
       .toLowerCase()
       .trim();
   }
@@ -591,17 +545,12 @@ export function buildInlineDiff(paragraphText: string, changes: TrackedChangeInf
     const normNeedle = normalize(rawNeedle);
     if (!normNeedle) continue;
 
-    // ── Strategy 1: exact match on normalized text ─────────────────────────
     let pos = normPara.indexOf(normNeedle);
 
-    // ── Strategy 2: fuzzy anchor — match first 40 chars, extend by length ──
-    // Handles cases where the middle of a long change has encoding differences
-    // that survived normalization (e.g. mixed ligatures, soft hyphens).
     if (pos === -1 && normNeedle.length > 40) {
       const anchor = normNeedle.slice(0, 40);
       const anchorPos = normPara.indexOf(anchor);
       if (anchorPos !== -1) {
-        // Verify the region roughly matches by checking the tail too
         const tail = normNeedle.slice(-20);
         const expectedEnd = anchorPos + normNeedle.length;
         const searchWindow = normPara.slice(anchorPos, expectedEnd + 20);
@@ -612,8 +561,6 @@ export function buildInlineDiff(paragraphText: string, changes: TrackedChangeInf
       }
     }
 
-    // ── Strategy 3: first-words match — for very long deletions/insertions ──
-    // Match on the first 6 words, use that as a positional anchor.
     if (pos === -1) {
       const firstWords = normNeedle.split(" ").slice(0, 6).join(" ");
       if (firstWords.length >= 10) {
@@ -630,18 +577,12 @@ export function buildInlineDiff(paragraphText: string, changes: TrackedChangeInf
       continue;
     }
 
-    // pos is an index into normPara. Because normalize() may have changed
-    // character counts (e.g. collapsed multiple spaces into one), we need to
-    // find the corresponding position in the ORIGINAL paragraphText.
-    // We do this by walking both strings in parallel until we've consumed
-    // `pos` normalized characters.
     const originalStart = normToOriginalPos(paragraphText, pos);
     const originalEnd   = normToOriginalPos(paragraphText, pos + normNeedle.length);
 
     spans.push({ start: originalStart, end: originalEnd, change: c });
   }
 
-  // Sort by position, drop overlapping spans (keep first)
   spans.sort((a, b) => a.start - b.start);
   const merged: Span[] = [];
   for (const span of spans) {
@@ -681,34 +622,23 @@ export function buildInlineDiff(paragraphText: string, changes: TrackedChangeInf
   return result;
 }
 
-// Maps a character position in the normalized string back to the corresponding
-// position in the original string. normalize() may collapse whitespace runs
-// (e.g. "  " → " ") so the two strings can have different lengths. We walk
-// both in parallel, advancing the original pointer past any characters that
-// normalize() would have removed or merged.
 function normToOriginalPos(original: string, normPos: number): number {
   let origIdx = 0;
   let normIdx = 0;
 
-  // Replicate the normalization transformations character by character
   while (origIdx < original.length && normIdx < normPos) {
     const ch = original[origIdx];
 
-    // Skip characters that normalize() removes entirely (none currently, but
-    // soft-hyphen \u00AD and zero-width spaces are common in Word docs)
     if (ch === "\u00AD" || ch === "\u200B" || ch === "\uFEFF") {
       origIdx++;
       continue;
     }
 
-    // Whitespace: normalize() collapses runs to a single space.
-    // Count one normalized char for the whole run.
     if (/\s/.test(ch)) {
-      // advance past the entire whitespace run in original
       while (origIdx < original.length && /\s/.test(original[origIdx])) {
         origIdx++;
       }
-      normIdx++; // one space in normalized string
+      normIdx++;
       continue;
     }
 
@@ -716,7 +646,6 @@ function normToOriginalPos(original: string, normPos: number): number {
     normIdx++;
   }
 
-  // If normPos overshoots (e.g. end of string), return end of original
   return Math.min(origIdx, original.length);
 }
 
@@ -789,24 +718,10 @@ export async function addWordCommentOnRedline(args: {
 }
 
 // ─── Cluster-spanning comment insertion ───────────────────────────────────────
-//
-// Inserts a single Word comment that spans the full range of ALL tracked
-// changes in the cluster (from the start of the first change to the end of
-// the last), so the comment appears anchored to the entire redlined region
-// rather than just the first change's text.
-//
-// Strategy:
-//   1. Load all tracked changes from the document.
-//   2. Match them to the cluster's change IDs.
-//   3. Get each matching change's Range and union them via expandTo.
-//   4. Insert the comment on the unioned range.
-//   5. Fall back to addWordCommentOnRedline if getRange() is unavailable or
-//      no IDs match (older Word versions).
 
 export async function addCommentOnCluster(args: {
   changeIds: string[];
   commentText: string;
-  // fallback fields used if the Revision.range approach fails:
   firstChangeText: string;
   paragraphContext: string;
   sectionTitle: string;
@@ -828,22 +743,14 @@ export async function addCommentOnCluster(args: {
   return Word.run(async (context) => {
     const body = context.document.body;
 
-    // ── Step 1: load scalars + navigate to range in one load call ────────────
-    // Use the nested path "items/range/text" to tell Office JS to also hydrate
-    // the range navigation property on each revision in the same sync.
-    // Some revision types (formatting, paragraph property) have no text range —
-    // we guard against that with null checks before using .range.
     const revisions = body.getTrackedChanges();
     revisions.load("items/id,items/index,items/range/text");
     await context.sync();
 
-    // ── Step 2: find matching revisions that also have a valid range ──────────
     const idSet = new Set(args.changeIds);
     const matching = revisions.items.filter((rev) => {
       const raw = rev as unknown as Record<string, unknown>;
       const id  = typeof raw["id"] === "string" ? raw["id"] : String(raw["id"] ?? "");
-      // Only keep revisions that matched an ID AND have a usable range object.
-      // Formatting/property revisions may have range === undefined or null.
       return idSet.has(id) && rev.range != null;
     });
 
@@ -858,17 +765,13 @@ export async function addCommentOnCluster(args: {
       });
     }
 
-    // ── Step 3: sort by document index, union ranges first → last ────────────
     const sorted = [...matching].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
 
     let unionRange: Word.Range = sorted[0].range;
     for (let i = 1; i < sorted.length; i++) {
-      // revision.range is only the changed text — not the whole paragraph —
-      // so expandTo spans exactly the cluster edits, nothing more.
       unionRange = unionRange.expandTo(sorted[i].range);
     }
 
-    // ── Step 4: insert the comment on the exact revision-spanning range ───────
     unionRange.insertComment(commentText);
     await context.sync();
 
@@ -939,10 +842,16 @@ function buildSectionMap(paragraphTexts: string[]): SectionEntry[] {
     const headingMatch = trimmed.match(SECTION_HEADING_RE);
     if (headingMatch) {
       sections.push(current);
+
+      // Extract the numeric prefix separately (e.g. "5.0") from the title (e.g. "PAYMENT")
+      // so sectionNumber can be used for ordering and sectionTitle for config lookup.
+      const numericMatch = trimmed.match(/^(\d+(?:\.\d+)*)/);
+      const numericPrefix = numericMatch?.[1] ?? "";
       const title = headingMatch[1].trim();
+
       current = {
-        sectionNumber: title,
-        sectionTitle: title,
+        sectionNumber: numericPrefix || title, // "5.0" if present, else "PAYMENT"
+        sectionTitle: title,                   // always just "PAYMENT"
         paragraphTexts: [trimmed],
         startParaIndex: i,
       };
@@ -968,7 +877,7 @@ function findSectionForText(
         return {
           sectionNumber: section.sectionNumber,
           sectionTitle: section.sectionTitle,
-          paragraphContext: para, // full paragraph — caller will extract a centered window
+          paragraphContext: para,
         };
       }
     }
@@ -991,7 +900,7 @@ function findSectionByPosition(
         return {
           sectionNumber: section.sectionNumber,
           sectionTitle: section.sectionTitle,
-          paragraphContext: paraTexts[i], // full paragraph — caller will extract a centered window
+          paragraphContext: paraTexts[i],
         };
       }
     }

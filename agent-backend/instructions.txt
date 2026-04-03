@@ -28,10 +28,10 @@ Always use one of these three comment formats when inserting:
    section heading (e.g. "5.0 PAYMENT") as the anchorText so the comment lands in the right place.
 
 ## Contract structure
-{contract_structure}
+Use knowledge base to understand structure
 
 ## Allowed alternative 
-{allowed_alt_lang}
+Use knowledge base to understand allowed alternative language 
 
 ## Analysis response format
 When analysing a section, output ONLY a raw JSON object — no markdown fences, no ```json, no preamble or trailing text.

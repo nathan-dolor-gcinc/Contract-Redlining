@@ -2,10 +2,9 @@
 
 import { session, resetSession } from "./state/session";
 import { registerAdvanceCallback, registerCommentWrittenCallback } from "./tools/dispatchTools";
-import { sendPrompt, primeThread } from "./api/client";
+import { sendPrompt, BACKEND_BASE_URL } from "./api/client";
 import {
   getRedlinedSections,
-  readWordBodyText,
   addWordCommentOnRedline,
   addCommentOnCluster,
   clusterSectionSemantically,
@@ -21,6 +20,32 @@ import {
 } from "./ui/cards";
 import { buildProgressTrack, markProgress, updateProgressLabel } from "./ui/progress";
 import { showEl, setText, getDocumentName } from "./ui/dom";
+
+// ─── Section ordering ─────────────────────────────────────────────────────────
+
+let _sectionOrder: Record<string, number> | null = null;
+
+async function fetchSectionOrder(): Promise<Record<string, number>> {
+  if (_sectionOrder) return _sectionOrder;
+  try {
+    const resp = await fetch(`${BACKEND_BASE_URL}/api/section-order`);
+    const data = await resp.json() as { sections: Record<string, number> };
+    _sectionOrder = data.sections;
+  } catch (err) {
+    console.warn("[review] Could not fetch section order — sections will not be sorted:", err);
+    _sectionOrder = {};
+  }
+  return _sectionOrder;
+}
+
+function getSectionOrder(sectionTitle: string, order: Record<string, number>): number {
+  if (!sectionTitle) return 999;
+  const cleaned = sectionTitle.replace(/^\d+(\.\d+)*\.?\s*/, "").trim().toUpperCase();
+  for (const [key, val] of Object.entries(order)) {
+    if (key === cleaned || key.includes(cleaned) || cleaned.includes(key)) return val;
+  }
+  return 999;
+}
 
 // ─── Initialization & scan ────────────────────────────────────────────────────
 
@@ -40,41 +65,34 @@ export async function initializeScan(): Promise<void> {
     setCardDisabled(cardIndex, true);
   });
 
-  const [redlinedSections, bodyText] = await Promise.all([
-    getRedlinedSections(),
-    readWordBodyText(40_000),
-  ]);
-  session.redlinedSections = redlinedSections;
+  // No longer prime the thread with the full contract body — the agent
+  // calls read_word_body on demand if it needs contract context. This keeps
+  // the thread small and avoids timeout errors on large documents.
+  const redlinedSections = await getRedlinedSections();
 
-  appendSysMsg("Reading contract and initialising agent…");
+  appendSysMsg("Scanning contract for tracked changes…");
 
-  try {
-    const conversationId = await primeThread(
-      `The following is the full text of the contract document the user will be reviewing. ` +
-        `Use it to answer questions about the contract.\n\n` +
-        `--- DOCUMENT START ---\n${bodyText}\n--- DOCUMENT END ---`
-    );
-    if (conversationId) {
-      session.conversationId = conversationId;
-      console.log("[initializeScan] Thread primed:", conversationId);
-    }
-  } catch (err) {
-    console.warn("[initializeScan] Could not prime thread:", err);
-  }
+  // ── Sort sections into document order ─────────────────────────────────────
+  const sectionOrder = await fetchSectionOrder();
+  const sortedSections = [...redlinedSections].sort(
+    (a, b) => getSectionOrder(a.sectionTitle, sectionOrder) - getSectionOrder(b.sectionTitle, sectionOrder)
+  );
+  session.redlinedSections = sortedSections;
 
   // ── Semantic clustering via /api/cluster (Foundry model, no agent thread) ───
   appendSysMsg("Grouping tracked changes into review clusters…");
 
   const clusterArrays = await Promise.all(
-    redlinedSections.map((s) =>
+    sortedSections.map((s) =>
       clusterSectionSemantically(s.sectionNumber, s.sectionTitle, s.changes)
     )
   );
   session.allClusters = clusterArrays.flat();
 
-  console.log("[clusters]", session.allClusters.map(
-    (c) => `[${c.sectionNumber}] ${c.sectionTitle} (${c.changes.length} edits)`
-  ));
+  console.log("[clusters]", session.allClusters.map((c, i) => {
+    const types = c.changes.map((ch) => `${ch.type}(${ch.author})`).join(", ");
+    return `${i}: [${c.sectionNumber}] ${c.sectionTitle} (${c.changes.length} edits) — ${types}`;
+  }));
 
   const totalChanges = session.allClusters.reduce((sum, cl) => sum + cl.changes.length, 0);
 
@@ -181,9 +199,6 @@ export async function handleCardAction(
     const firstChange = cluster?.changes[0];
     const isDeletion = firstChange?.type?.toLowerCase().includes("delete");
 
-    // Use addCommentOnCluster so the Word comment spans the full range of
-    // ALL tracked changes in the cluster (first to last), not just the
-    // first change's text. Falls back to text-search if getRange() fails.
     const result = await addCommentOnCluster({
       changeIds:        cluster?.changes.map((c) => c.id) ?? [],
       commentText,
@@ -230,8 +245,6 @@ export async function handleCardAction(
     setLoading(false);
 
     if (confirmReply) {
-      // Guard: if the model echoed back JSON instead of a confirmation sentence,
-      // suppress it and show a safe fallback so the raw object never reaches the UI.
       const looksLikeJson = confirmReply.trimStart().startsWith("{") || confirmReply.trimStart().startsWith("```");
       if (looksLikeJson) {
         console.warn("[review] notifyPrompt response was JSON — suppressing and using fallback");

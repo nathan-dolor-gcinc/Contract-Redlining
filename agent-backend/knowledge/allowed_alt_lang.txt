@@ -1,4 +1,4 @@
-Downstream Revisions Section Reference
+Downstream Revisions Section Reference for Subcontract Agreement
 Issue	proposed language
 Claims	Notwithstanding the foregoing, Provider may pursue a claim directly against Company, but only to the extent the alleged damages are caused solely by Company and no others.
 Claims	In the event that Company is compensated by Client by reason of Client's termination or suspension, Company shall pay to Provider an equitable portion of said sum based upon the Work performed, but only to the extent actually received by Company.

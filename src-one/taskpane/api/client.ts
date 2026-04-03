@@ -108,6 +108,7 @@ export async function endSession(conversationId: string | null): Promise<EndSess
 
 // ─── Prime ────────────────────────────────────────────────────────────────────
 
+/*
 export async function primeThread(content: string): Promise<string | null> {
   try {
     const resp = await fetch(`${BACKEND_BASE_URL}/api/prime`, {
@@ -126,3 +127,4 @@ export async function primeThread(content: string): Promise<string | null> {
     return null;
   }
 }
+  */

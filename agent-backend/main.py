@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from agent_service import LexAIAgent, _extract_snippet_fallback
+from sections_config import SECTIONS, get_section_order
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +47,10 @@ async def lifespan(app: FastAPI):
     await agent.create()
     yield
     await agent.delete()
+    try:
+        await asyncio.wait_for(agent.delete(), timeout=3.0)
+    except (asyncio.TimeoutError, Exception) as e:
+        logger.warning(f"Agent cleanup skipped: {e}")
 
 
 # ─── App ───────────────────────────────────────────────────────────────────────
@@ -108,6 +113,15 @@ class ClusterRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "LexAI"}
+
+@app.get("/api/section-order")
+async def section_order():
+    """
+    Return the section order map so the frontend can sort clusters
+    into linear document order. Update sections_config.py to change
+    the order or add sections for a different contract.
+    """
+    return {"sections": SECTIONS}
 
 
 @app.post("/api/prime")
